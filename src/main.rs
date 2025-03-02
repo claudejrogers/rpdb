@@ -1,34 +1,64 @@
-use clap::Parser;
+use clap::{Parser, Subcommand, ValueEnum};
 use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::Path;
 mod atom;
 use atom::{AtomCollection, RecordType};
 use std::collections::HashMap;
+use tokio::io::AsyncWriteExt;
 
-/// Extract substructures from a PDB
+#[derive(Debug, Clone, ValueEnum)]
+enum FileKind {
+    Pdb,
+    Cif,
+}
+
+/// CLI utilities for PDB files
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
-struct Args {
-    /// Path to PDB
-    #[arg(short, long)]
-    path: String,
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
 
-    /// Record type to extract
-    #[arg(short, long, default_value = "atom")]
-    record_type: Option<RecordType>,
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Extract substructures from a PDB
+    #[command(arg_required_else_help = true)]
+    Parse {
+        /// Path to PDB
+        path: String,
 
-    /// Chain to select, [A-Z]
-    #[arg(short, long)]
-    chain: Option<Vec<char>>,
+        /// Record type to extract
+        #[arg(short, long, default_value = "atom")]
+        record_type: RecordType,
 
-    /// Residue to select
-    #[arg(short = 'R', long)]
-    res: Option<String>,
+        /// Chain to select, [A-Z]
+        #[arg(short, long)]
+        chain: Option<Vec<char>>,
 
-    /// Move coordinates to center on origin
-    #[arg(long, default_value_t = false)]
-    center: bool,
+        /// Residue to select
+        #[arg(short = 'R', long)]
+        res: Option<String>,
+
+        /// Move coordinates to center on origin
+        #[arg(long, default_value_t = false)]
+        center: bool,
+    },
+
+    /// Download structure files
+    #[command(arg_required_else_help = true)]
+    Fetch {
+        /// Name(s) of structure file(s)
+        name: Vec<String>,
+
+        /// Kind of structure file
+        #[arg(short, long, default_value = "pdb")]
+        kind: FileKind,
+
+        #[arg(long, default_value_t = false)]
+        compress: bool,
+    },
 }
 
 fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
@@ -46,50 +76,118 @@ fn get_chain_mask(chain: &Option<Vec<char>>) -> u32 {
     })
 }
 
-fn main() {
-    let args = Args::parse();
+async fn download_structure(
+    client: reqwest::Client,
+    name: &str,
+    ext: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let path = format!("{}.{}", name, ext);
+    println!("Downloading {}", path);
+    let url = format!("https://files.rcsb.org/download/{}", path);
+    let resp = client.get(url).send().await?;
+    if resp.status().is_success() {
+        let mut file = tokio::fs::File::create(&path).await?;
+        let body = resp.bytes().await?;
+        file.write_all(&body).await?;
+        println!("Saved {}", path)
+    } else {
+        println!("Download failed for {}: {:?}", path, resp.status());
+    }
+    Ok(())
+}
 
-    let record = match args.record_type {
-        Some(RecordType::Hetatm) => "HETATM ",
-        _ => "ATOM  ",
-    };
+#[tokio::main]
+async fn main() {
+    let args = Cli::parse();
 
-    let res = args.res.clone();
-    let chains = get_chain_mask(&args.chain);
+    match args.command {
+        Commands::Parse {
+            path,
+            record_type,
+            chain,
+            res,
+            center,
+        } => {
+            let record = match record_type {
+                RecordType::Hetatm => "HETATM ",
+                RecordType::Atom => "ATOM  ",
+            };
 
-    let mut collection =
-        AtomCollection::new(args.record_type.expect("Record type should have a default"));
-    let mut connections = HashMap::<u32, String>::new();
-    if let Ok(lines) = read_lines(args.path) {
-        for line in lines.map_while(Result::ok) {
-            if line.starts_with(record) {
-                collection
-                    .add_atom(&line, |a| {
-                        let test_chain = (chains & (1 << ((a.chain as u32) % 32))) != 0;
-                        res.as_ref()
-                            .map_or(test_chain, |name| test_chain && (a.res_name == *name))
-                    })
-                    .unwrap();
-            } else if line.starts_with("CONECT") && (args.record_type == Some(RecordType::Hetatm)) {
-                if let Ok(id) = line
-                    .get(6..11)
-                    .unwrap_or("Could not get conect ID")
-                    .trim()
-                    .parse::<u32>()
-                {
-                    connections.insert(id, line.clone());
+            let res = res.clone();
+            let chains = get_chain_mask(&chain);
+
+            let mut collection = AtomCollection::new(record_type);
+            let mut connections = HashMap::<u32, String>::new();
+            if let Ok(lines) = read_lines(path) {
+                for line in lines.map_while(Result::ok) {
+                    if line.starts_with(record) {
+                        collection
+                            .add_atom(&line, |a| {
+                                let test_chain = (chains & (1 << ((a.chain as u32) % 32))) != 0;
+                                res.as_ref()
+                                    .map_or(test_chain, |name| test_chain && (a.res_name == *name))
+                            })
+                            .unwrap();
+                    } else if line.starts_with("CONECT") && (record_type == RecordType::Hetatm) {
+                        if let Ok(id) = line
+                            .get(6..11)
+                            .unwrap_or("Could not get conect ID")
+                            .trim()
+                            .parse::<u32>()
+                        {
+                            connections.insert(id, line.clone());
+                        }
+                    }
+                }
+            }
+            if center {
+                collection.center_to_origin();
+            }
+            collection.output();
+            if record_type == RecordType::Hetatm {
+                for atom in &collection.entries {
+                    if let Some(line) = connections.get(&atom.id) {
+                        println!("{}", line);
+                    }
                 }
             }
         }
-    }
-    if args.center {
-        collection.center_to_origin();
-    }
-    collection.output();
-    if args.record_type == Some(RecordType::Hetatm) {
-        for atom in &collection.entries {
-            if let Some(line) = connections.get(&atom.id) {
-                println!("{}", line);
+
+        Commands::Fetch {
+            name,
+            kind,
+            compress,
+        } => {
+            let ext = match kind {
+                FileKind::Pdb => {
+                    if compress {
+                        "pdb.gz"
+                    } else {
+                        "pdb"
+                    }
+                }
+                FileKind::Cif => {
+                    if compress {
+                        "cif.gz"
+                    } else {
+                        "cif"
+                    }
+                }
+            };
+            let client = reqwest::Client::builder()
+                .build()
+                .expect("Failed to create HTTP client");
+
+            let handles = name
+                .into_iter()
+                .map(|name| {
+                    let clientc = client.clone();
+                    tokio::spawn(async move { download_structure(clientc, &name, &ext).await })
+                })
+                .collect::<Vec<_>>();
+
+            for handle in handles {
+                let _ = handle.await.expect("Failed to complete download");
             }
         }
     }
